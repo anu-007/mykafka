@@ -8,6 +8,7 @@ API_VERSIONS_KEY = 18
 DESCRIBE_TOPIC_PARTITIONS_KEY = 75
 UNKNOWN_TOPIC_OR_PARTITION = 3
 FETCH = 1
+PRODUCE = 0
 
 
 def encode_varint(value):
@@ -112,6 +113,7 @@ def build_api_versions_response(correlation_id, error_code=0):
         (API_VERSIONS_KEY, 0, 4),
         (DESCRIBE_TOPIC_PARTITIONS_KEY, 0, 0),
         (FETCH, 0, 16),
+        (PRODUCE, 10, 10),
     ]
     response_body = struct.pack(">i", correlation_id)
     response_body += struct.pack(">h", error_code)
@@ -219,6 +221,161 @@ def build_record_batch(records, base_offset=0):
 
 def empty_record_batch():
     return build_record_batch([])
+
+
+def decode_varint_bytes(data, offset):
+    length, offset = decode_varint(data, offset)
+    if length == 0:
+        return None, offset
+    actual = length - 1
+    value = data[offset : offset + actual]
+    offset += actual
+    return value, offset
+
+
+def parse_record(data, offset):
+    _, offset = decode_varint(data, offset)
+    offset += 1
+    _, offset = decode_varint(data, offset)
+    _, offset = decode_varint(data, offset)
+    _, offset = decode_varint_bytes(data, offset)
+    value, offset = decode_varint_bytes(data, offset)
+    header_count, offset = decode_varint(data, offset)
+    for _ in range(header_count - 1):
+        _, offset = decode_varint_bytes(data, offset)
+        _, offset = decode_varint_bytes(data, offset)
+    return value, offset
+
+
+def parse_record_batch(data, offset):
+    _ = struct.unpack(">q", data[offset : offset + 8])[0]
+    offset += 8
+    length = struct.unpack(">i", data[offset : offset + 4])[0]
+    offset += 4
+    end = offset + length
+    offset += 4  # partition_leader_epoch
+    magic = data[offset]
+    offset += 1
+    if magic != 2:
+        return [], end
+    offset += 4  # crc
+    offset += 2  # attributes
+    offset += 4  # last_offset_delta
+    offset += 8  # first_timestamp
+    offset += 8  # max_timestamp
+    offset += 8  # producer_id
+    offset += 2  # producer_epoch
+    offset += 4  # base_sequence
+    records_count = struct.unpack(">i", data[offset : offset + 4])[0]
+    offset += 4
+    records = []
+    for _ in range(records_count):
+        value, offset = parse_record(data, offset)
+        records.append(value)
+    return records, end
+
+
+def parse_produce_request(data, offset):
+    _, offset = decode_compact_string(data, offset)  # transactional_id
+    offset += 2  # acks
+    offset += 4  # timeout_ms
+
+    def decode_partition(data, offset):
+        partition = struct.unpack(">i", data[offset : offset + 4])[0]
+        offset += 4
+        records_length, offset = decode_varint(data, offset)
+        records = []
+        if records_length > 1:
+            actual = records_length - 1
+            records_data = data[offset : offset + actual]
+            offset += actual
+            records, _ = parse_record_batch(records_data, 0)
+        tag_count, offset = decode_varint(data, offset)
+        if tag_count > 0:
+            offset += tag_count - 1
+        return {"partition": partition, "records": records}, offset
+
+    def decode_topic(data, offset):
+        topic_id = data[offset : offset + 16]
+        offset += 16
+        partitions, offset = decode_compact_array(data, offset, decode_partition)
+        return {"topic_id": topic_id, "partitions": partitions}, offset
+
+    topic_data, offset = decode_compact_array(data, offset, decode_topic)
+    return topic_data
+
+
+def _build_partition_response(partition_request, topic, kafka):
+    partition_index = partition_request["partition"]
+    partition_count = len(topic["partitions"])
+    if partition_index < 0 or partition_index >= partition_count:
+        return {
+            "partition": partition_index,
+            "error_code": UNKNOWN_TOPIC_OR_PARTITION,
+            "base_offset": -1,
+            "log_append_time": -1,
+            "log_start_offset": -1,
+        }
+    base_offset = kafka._log_offset(topic["name"], partition_index)
+    for value in partition_request["records"]:
+        kafka.append_message(topic["name"], partition_index, value)
+    return {
+        "partition": partition_index,
+        "error_code": 0,
+        "base_offset": base_offset,
+        "log_append_time": -1,
+        "log_start_offset": 0,
+    }
+
+
+def _build_topic_response(topic_request, kafka):
+    topic_id = topic_request["topic_id"]
+    topic = _find_topic_by_id(kafka, topic_id)
+    if topic is None:
+        partitions = [
+            {
+                "partition": p["partition"],
+                "error_code": UNKNOWN_TOPIC_OR_PARTITION,
+                "base_offset": -1,
+                "log_append_time": -1,
+                "log_start_offset": -1,
+            }
+            for p in topic_request["partitions"]
+        ]
+    else:
+        partitions = [
+            _build_partition_response(p, topic, kafka)
+            for p in topic_request["partitions"]
+        ]
+    return {"topic_id": topic_id, "partitions": partitions}
+
+
+def build_produce_response(correlation_id, produce_topics, kafka):
+    def encode_partition(partition_response):
+        body = struct.pack(">i", partition_response["partition"])
+        body += struct.pack(">h", partition_response["error_code"])
+        body += struct.pack(">q", partition_response["base_offset"])
+        body += struct.pack(">q", partition_response["log_append_time"])
+        body += struct.pack(">q", partition_response["log_start_offset"])
+        body += encode_compact_array([], lambda _: b"")
+        body += encode_compact_string(None)
+        body += encode_varint(0)
+        return body
+
+    def encode_topic(topic_response):
+        body = topic_response["topic_id"]
+        body += encode_compact_array(topic_response["partitions"], encode_partition)
+        body += encode_varint(0)
+        return body
+
+    response_topics = [_build_topic_response(t, kafka) for t in produce_topics]
+    response_body = struct.pack(">i", correlation_id)
+    response_body += struct.pack(">i", 0)
+    response_body += encode_compact_array(response_topics, encode_topic)
+    response = struct.pack(">i", len(response_body)) + response_body
+    return response
+
+
 
 
 def parse_fetch_request(data, offset):
@@ -394,6 +551,9 @@ class MyKafka:
                     break
         return messages
 
+    def _log_offset(self, topic, partition):
+        return len(self.read_messages(topic, partition, 0, 1000000))
+
     def init_server(self):
         self.server = socket.create_server((self.host, self.port), reuse_port=True)
 
@@ -414,30 +574,43 @@ class MyKafka:
             data += chunk
         return data
 
+    def _build_response(self, header, data):
+        if header["api_key"] == API_VERSIONS_KEY:
+            return build_api_versions_response(header["correlation_id"])
+        if header["api_key"] == DESCRIBE_TOPIC_PARTITIONS_KEY:
+            topics = parse_describe_topic_partitions_request(data, header["body_offset"])
+            if topics is None:
+                topics = []
+            return build_describe_topic_partitions_response(
+                header["correlation_id"], topics, self
+            )
+        if header["api_key"] == FETCH:
+            fetch_topics = parse_fetch_request(data, header["body_offset"])
+            if fetch_topics is None:
+                fetch_topics = []
+            return build_fetch_response(
+                header["correlation_id"], fetch_topics, self
+            )
+        if header["api_key"] == PRODUCE:
+            if header["api_version"] != 10:
+                return build_api_versions_response(
+                    header["correlation_id"], error_code=35
+                )
+            produce_topics = parse_produce_request(data, header["body_offset"])
+            if produce_topics is None:
+                produce_topics = []
+            return build_produce_response(
+                header["correlation_id"], produce_topics, self
+            )
+        return build_api_versions_response(
+            header["correlation_id"], error_code=35
+        )
+
     def _handle_request(self, data, conn):
         header = parse_request_header(data)
         if header is None:
             return False
-        if header["api_key"] == API_VERSIONS_KEY:
-            response = build_api_versions_response(header["correlation_id"])
-        elif header["api_key"] == DESCRIBE_TOPIC_PARTITIONS_KEY:
-            topics = parse_describe_topic_partitions_request(data, header["body_offset"])
-            if topics is None:
-                topics = []
-            response = build_describe_topic_partitions_response(
-                header["correlation_id"], topics, self
-            )
-        elif header["api_key"] == FETCH:
-            fetch_topics = parse_fetch_request(data, header["body_offset"])
-            if fetch_topics is None:
-                fetch_topics = []
-            response = build_fetch_response(
-                header["correlation_id"], fetch_topics, self
-            )
-        else:
-            response = build_api_versions_response(
-                header["correlation_id"], error_code=35
-            )
+        response = self._build_response(header, data)
         self.send(conn, response)
         return True
 
